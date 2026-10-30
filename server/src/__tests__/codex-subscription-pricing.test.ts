@@ -91,21 +91,32 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(events[0]).toMatchObject({ billingType: "subscription_included", costStatus: "estimated", costCents: 0 });
   });
 
-  it("sums the estimates of attempts that are all subscription runs", async () => {
+  async function settle(runId: string) {
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    expect(await accountRunCost(db, runId)).toBe(true);
+    return db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId));
+  }
+
+  it("sums the estimates of attempts that are all subscription runs, whichever alias they report", async () => {
     const { recorder, runId } = await codexRun();
-    await recorder.capture(codexReceipt({ attemptId: randomUUID() }));
+    await recorder.capture(codexReceipt({ attemptId: randomUUID(), billingType: "subscription_included" }));
     const total = await recorder.capture(codexReceipt({ attemptId: randomUUID(), model: "gpt-6.1-terra" }));
     expect(total.costStatus).toBe("estimated");
+    expect(total.billingType).not.toBe("unknown");
     expect(Number(total.costUsdExact)).toBeCloseTo(4.65, 9);
-    expect(Number((await usageOf(runId)).costUsdExact)).toBeCloseTo(4.65, 9);
+    const events = await settle(runId);
+    expect(events.reduce((sum, event) => sum + event.costCents, 0)).toBe(0);
+    expect(events.every(event => event.billingType === "subscription_included")).toBe(true);
   });
 
-  it("counts a subscription attempt as no spend when another attempt is billed by the API", async () => {
-    const { recorder } = await codexRun();
+  it("charges only the API attempt when a run mixes API and subscription attempts", async () => {
+    const { recorder, runId } = await codexRun();
     await recorder.capture(codexReceipt({ attemptId: randomUUID() }));
     const total = await recorder.capture(codexReceipt({ attemptId: randomUUID(), biller: "openai", billingType: "api", costUsd: 1 }));
     expect(total.billingType).toBe("unknown");
     expect(total.costStatus).toBe("reported");
     expect(Number(total.costUsdExact)).toBeCloseTo(1, 9);
+    const events = await settle(runId);
+    expect(events.reduce((sum, event) => sum + event.costCents, 0)).toBe(100);
   });
 });
