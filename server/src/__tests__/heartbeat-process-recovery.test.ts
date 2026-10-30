@@ -9920,6 +9920,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("leaves the work of an agent paused only by its company's pause for the resume", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture({
+      agentStatus: "paused",
+    });
+    await db.update(companies).set({ status: "paused" }).where(eq(companies.id, companyId));
+    await db.update(agents).set({
+      lifecycleState: "paused",
+      lifecycleHolds: ["company_paused"],
+      lifecycleOperation: { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 1, resumeState: "ready" },
+    }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+
+    const paused = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(paused.escalated).toBe(0);
+    expect(paused.issueIds).toEqual([]);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "todo" });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+
+    await db.update(companies).set({ status: "active" }).where(eq(companies.id, companyId));
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready", lifecycleHolds: [] }).where(eq(agents.id, agentId));
+    const resumed = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(resumed.assignmentDispatched).toBe(1);
+    expect(resumed.issueIds).toEqual([issueId]);
+  });
+
   it("routes paused assigned work to the board without waking available executives", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture({
       agentStatus: "paused",

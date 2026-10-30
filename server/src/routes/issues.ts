@@ -37,7 +37,7 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
 import { and, asc, desc, eq, inArray, isNull, notInArray, sql, type SQL } from "drizzle-orm";
-import { isAssignableDuringCompanyPause } from "../modules/agent-lifecycle/index.js";
+import { resumesWithCompany } from "../modules/agent-lifecycle/index.js";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -7646,13 +7646,13 @@ export function issueRoutes(
     );
   }
 
-  async function isAssignableDuringCompanyPauseById(agentId: string) {
+  async function resumesWithCompanyById(agentId: string) {
     const [row] = await db.select({
       lifecycleState: agents.lifecycleState,
       lifecycleHolds: agents.lifecycleHolds,
       lifecycleOperation: agents.lifecycleOperation,
     }).from(agents).where(eq(agents.id, agentId));
-    return Boolean(row && isAssignableDuringCompanyPause(row));
+    return Boolean(row && resumesWithCompany(row));
   }
 
   async function normalizeIssueAssigneeAgentReference(
@@ -7692,7 +7692,7 @@ export function issueRoutes(
     // for a later unpause is a legitimate workflow. An agent paused only by
     // its company's pause runs the work when the company resumes.
     if (options.actorType === "agent" && resolved.agent.status === "paused" &&
-        !await isAssignableDuringCompanyPauseById(resolved.agent.id)) {
+        !await resumesWithCompanyById(resolved.agent.id)) {
       throw conflict(
         "Cannot assign work to a paused agent. Assign an invokable agent, leave the issue unassigned, or escalate to a board operator instead.",
         { assigneeAgentId: resolved.agent.id, assigneeStatus: "paused" },

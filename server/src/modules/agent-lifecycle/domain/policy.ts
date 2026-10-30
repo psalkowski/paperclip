@@ -18,7 +18,7 @@ export function isCompanyOnlyHold(holds: readonly string[]): boolean {
   return holds.every(hold => hold === "company_paused");
 }
 
-export function isAssignableDuringCompanyPause(agent: {
+export function resumesWithCompany(agent: {
   lifecycleState: string; lifecycleHolds: readonly string[]; lifecycleOperation: { resumeState?: string } | null;
 }): boolean {
   return ["pausing", "paused"].includes(agent.lifecycleState) && agent.lifecycleHolds.length > 0 &&
