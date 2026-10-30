@@ -2,15 +2,23 @@ import { centsToUsd, unitsToCents, usdToUnits } from "@paperclipai/shared";
 import type { AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 
 // Immutable, reviewed rate card. Existing receipts retain their selected rates.
-// https://developers.openai.com/api/docs/pricing (retrieved 2026-09-30)
-const VERSION = "openai-standard-2026-09-30";
+// https://developers.openai.com/api/docs/pricing (retrieved 2026-10-30)
+const VERSION = "openai-standard-2026-10-30";
 const RATES: Record<string, readonly [string, string, string, string]> = {
   "gpt-6-astra": ["10", "1", "12.5", "50"],
   "gpt-6-sol": ["2", "0.2", "2.5", "10"],
   "gpt-6.1-sol": ["2", "0.1", "2.5", "10"],
+  "gpt-6.1-terra": ["1", "0.05", "1.25", "5"],
   "gpt-6-luna": ["0.1", "0.01", "0.125", "0.5"],
   "gpt-5.6-sol": ["4", "0.4", "5", "20"],
+  "gpt-5.6-terra": ["2", "0.2", "2.5", "12"],
+  "gpt-5.6-luna": ["0.2", "0.02", "0.25", "1.2"],
 };
+const SUBSCRIPTION_BILLING_TYPES = ["subscription", "subscription_included"];
+
+export function isSubscriptionBillingType(billingType: string | null | undefined): boolean {
+  return SUBSCRIPTION_BILLING_TYPES.includes(billingType ?? "");
+}
 
 /** Price new, direct-API receipts only. A token-price estimate is not an invoice.
  * Run totals cannot establish per-request context length or cache-write splits;
@@ -24,8 +32,9 @@ export function priceCodexReceipt(
     receipt.costUsdExact != null ||
     receipt.cacheAdjustedCostUsd != null ||
     receipt.provider !== "openai" ||
-    receipt.biller !== "openai" ||
-    !["api", "metered_api"].includes(receipt.billingType ?? "") ||
+    !(isSubscriptionBillingType(receipt.billingType)
+      ? ["chatgpt", "openai"].includes(receipt.biller ?? "")
+      : receipt.biller === "openai" && ["api", "metered_api"].includes(receipt.billingType ?? "")) ||
     receipt.usageBasis !== "per_run" ||
     !receipt.usage ||
     receipt.usageByModel?.length
@@ -69,6 +78,7 @@ export function priceCodexReceipt(
   const divisor = 1_000_000n * tierDenominator * 2n;
   const costCents = unitsToCents((units + divisor / 2n) / divisor);
   const assumptions = [
+    ...(isSubscriptionBillingType(receipt.billingType) ? ["subscription run priced at the API list-price equivalent"] : []),
     !context?.serviceTier
       ? "standard processing assumed"
       : `${context.serviceTier} processing`,

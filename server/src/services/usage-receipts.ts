@@ -1,6 +1,6 @@
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { priceAnthropicReceipt } from "./anthropic-pricing.js";
-import { priceCodexReceipt } from "./codex-pricing.js";
+import { isSubscriptionBillingType, priceCodexReceipt } from "./codex-pricing.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -263,9 +263,11 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     } };
     if (parts.length > 1) {
       let total = 0n, priced = true;
+      const allSubscription = parts.every(part => isSubscriptionBillingType(part.billingType));
       for (const part of parts) {
-        const subscription = ["subscription", "subscription_included"].includes(part.billingType ?? "");
-        const cost = subscription ? 0 : part.cacheAdjustedCostUsd ?? part.costUsdExact ?? part.costUsd;
+        const subscription = isSubscriptionBillingType(part.billingType);
+        const reported = part.cacheAdjustedCostUsd ?? part.costUsdExact ?? part.costUsd;
+        const cost = subscription ? allSubscription && part.costStatus === "estimated" ? reported ?? 0 : 0 : reported;
         if (cost == null || (!subscription && part.costStatus === "unpriced")) priced = false;
         if (cost != null) total += usdToUnits(cost);
       }
@@ -283,7 +285,8 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
           || Object.values(part.usage ?? {}).some(value => (value ?? 0) !== 0);
       });
       receipt.usageByModel = attributed.length === 1 ? attributed[0].usageByModel : undefined;
-      receipt.costStatus = priced && parts.some(part => part.costStatus === "estimated") ? "estimated" : priced ? "reported" : "unpriced";
+      const estimated = parts.some(part => part.costStatus === "estimated" && (allSubscription || !isSubscriptionBillingType(part.billingType)));
+      receipt.costStatus = priced && estimated ? "estimated" : priced ? "reported" : "unpriced";
       receipt.pricingProvenance = { source: receipt.costStatus === "estimated" ? "rate_card" : "unknown", version: "per-attempt/v1", evidence: "Sum of attempted-run receipts; component prices are retained in the immutable receipt journal." };
       // Every attempted provider must supply a final receipt before the total
       // can be considered complete, even if a later attempt succeeded.
