@@ -44,10 +44,29 @@ function isReleasedSshLease(lease: typeof environmentLeases.$inferSelect) {
     ["released", "expired", "failed"].includes(lease.status) && lease.cleanupStatus !== "failed";
 }
 
+type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
+
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], host: HostProcessProbe = hostProcessProbe) {
   if (!agentIds.length) return true;
-  const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+  // Agents keep every historical run, and result_json/context_snapshot can be
+  // megabytes each. Read only what the stop proof needs; the few cancelled runs
+  // that need deeper evidence load their full row one at a time below.
+  const runs = await db.select({
+    id: heartbeatRuns.id,
+    companyId: heartbeatRuns.companyId,
+    status: heartbeatRuns.status,
+    startedAt: heartbeatRuns.startedAt,
+    runtimeMode: heartbeatRuns.runtimeMode,
+    executionStage: heartbeatRuns.executionStage,
+    processPid: heartbeatRuns.processPid,
+    processGroupId: heartbeatRuns.processGroupId,
+    processStartedAt: heartbeatRuns.processStartedAt,
+    controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+    controllerBootId: heartbeatRuns.controllerBootId,
+    finishedAt: heartbeatRuns.finishedAt,
+    executionCancellationState: sql<string | null>`${heartbeatRuns.resultJson}->'executionCancellation'->>'state'`,
+  }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const leases = await db.select().from(environmentLeases).where(or(
     inArray(environmentLeases.heartbeatRunId, runIds),
@@ -78,16 +97,29 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], hos
     }
     if (await localProcessAlive(run, host)) return false;
     if (run.status !== "cancelled" || !run.startedAt) continue;
+    let fullRun: HeartbeatRun | null | undefined;
+    const loadFullRun = async () => fullRun === undefined
+      ? fullRun = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0] ?? null
+      : fullRun;
+    // A vanished row is not stop proof; the next sweep re-reads the agent's runs.
+    const usedConversationAdapter = async () => {
+      const row = await loadFullRun();
+      return !row || await runUsedConversationAdapter(db, row);
+    };
+    const cancelledNativeStartup = async () => {
+      const row = await loadFullRun();
+      return Boolean(row) && await isCancelledNativeStartup(db, row!, coordinators.find(coordinator => coordinator.runId === run.id));
+    };
     if (run.runtimeMode === "native" && !run.processPid && !run.processGroupId &&
         !await hasNativeLocalProcessStop(db, run.companyId, run.id) &&
-        !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
+        !await cancelledNativeStartup()) return false;
     const neverDispatched = run.runtimeMode === "legacy" && run.executionStage === "preparing" &&
       Boolean(run.controllerBootId && run.controllerBootId !== legacyControllerBootId &&
         run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt <= new Date());
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId && !neverDispatched &&
-        (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
-        !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
-        !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
+        run.executionCancellationState !== "acknowledged" &&
+        !(run.executionStage === "settled" && !await usedConversationAdapter()) &&
+        !await cancelledNativeStartup()) return false;
   }
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {
