@@ -1,13 +1,16 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { agents, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
+import { agents, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
 import { heartbeatService } from "./heartbeat.js";
 import { listInvalidOrgChainDescendantIds } from "./agent-invokability.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
-import type { LifecycleDriver } from "../modules/agent-lifecycle/index.js";
+import { isCompanyOnlyHold, type LifecycleDriver } from "../modules/agent-lifecycle/index.js";
 import { agentHarnessVerificationService } from "./agent-harness-verification.js";
 
 export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): LifecycleDriver {
   const { verify } = agentHarnessVerificationService(db, manager);
+  const hasRunningRun = (agentId: string) => db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running"))).limit(1)
+    .then(rows => rows.length > 0);
   const heartbeat = heartbeatService(db, { pluginWorkerManager: manager });
   return {
     async onReady(agent) {
@@ -40,6 +43,9 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
       if (agent.lifecycleState === "verifying") return verify(agent);
       if (["pausing", "terminating", "cleaning_up"].includes(agent.lifecycleState)) {
         const companyAgents = await db.select().from(agents).where(eq(agents.companyId, agent.companyId));
+        const self = companyAgents.find(row => row.id === agent.id);
+        if (agent.lifecycleState === "pausing" && self && isCompanyOnlyHold(self.lifecycleHolds) &&
+            await hasRunningRun(agent.id)) return "pending";
         const ids = agent.lifecycleState === "pausing" ? [agent.id]
           : [agent.id, ...listInvalidOrgChainDescendantIds(agent.id, companyAgents)];
         if (!await heartbeat.stopInvocationsForAgents(ids, "Agent lifecycle stop requested")) return "pending";

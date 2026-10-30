@@ -14,6 +14,17 @@ export function isAgentAwaitingSetup(agent: { lifecycleState: string; lifecycleH
   return ["preparing", "verifying", "resuming"].includes(agent.lifecycleState) && agent.lifecycleHolds.length === 0;
 }
 
+export function isCompanyOnlyHold(holds: readonly string[]): boolean {
+  return holds.every(hold => hold === "company_paused");
+}
+
+export function isAssignableDuringCompanyPause(agent: {
+  lifecycleState: string; lifecycleHolds: readonly string[]; lifecycleOperation: { resumeState?: string } | null;
+}): boolean {
+  return ["pausing", "paused"].includes(agent.lifecycleState) && agent.lifecycleHolds.length > 0 &&
+    isCompanyOnlyHold(agent.lifecycleHolds) && agent.lifecycleOperation?.resumeState === "ready";
+}
+
 export function transition(state: AgentLifecycleState, command: LifecycleCommand,
   resumeState: "preparing" | "verifying" | "ready" = "ready"): AgentLifecycleState {
   if (command === "retry") {

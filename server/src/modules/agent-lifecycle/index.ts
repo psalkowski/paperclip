@@ -12,7 +12,7 @@ import { assertRootDatabase, createLifecycleStore } from "./adapters/postgres.js
 import { createLifecycleWorker } from "./application/worker.js";
 import type { LifecycleDriver } from "./application/ports.js";
 
-export { AgentLifecycleConflict, canConfigureAgentConnection, isAgentAwaitingSetup } from "./domain/policy.js";
+export { AgentLifecycleConflict, canConfigureAgentConnection, isAgentAwaitingSetup, isAssignableDuringCompanyPause, isCompanyOnlyHold } from "./domain/policy.js";
 
 export type { HireDecisionTarget } from "./adapters/approvals.js";
 export type { LifecycleDriver, LifecycleAgent, LifecycleFailure } from "./application/ports.js";

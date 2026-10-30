@@ -199,6 +199,62 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]!.status).toBe("queued");
   });
 
+  async function readyAgentWithRunningRun() {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Drained", status: "running",
+      lifecycleState: "ready" }).returning();
+    const work = worker(createLifecycleDriver(db, {} as never).runHost);
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "running", invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date() }).returning();
+    return { agent, run, work };
+  }
+  async function setCompanyStatus(status: "active" | "paused") {
+    await db.update(companies).set({ status }).where(eq(companies.id, companyId));
+    await createAgentLifecycle(db).reconcilePolicyHolds(companyId);
+  }
+  async function runStatus(id: string) {
+    return (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!.status;
+  }
+
+  it("lets a running run finish through a company pause before the agent pauses", async () => {
+    const { agent, run, work } = await readyAgentWithRunningRun();
+    await setCompanyStatus("paused");
+    await work.process(agent.id);
+    expect(await runStatus(run.id)).toBe("running");
+    expect((await current(agent.id)).lifecycleState).toBe("pausing");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    await createAgentLifecycle(db).retry(agent.id);
+    await work.process(agent.id);
+    expect(await runStatus(run.id)).toBe("succeeded");
+    expect((await current(agent.id)).lifecycleState).toBe("paused");
+    await setCompanyStatus("active");
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleState).toBe("ready");
+  });
+
+  it("keeps the run when the company resumes before it finishes", async () => {
+    const { agent, run, work } = await readyAgentWithRunningRun();
+    await setCompanyStatus("paused");
+    await work.process(agent.id);
+    await setCompanyStatus("active");
+    await createAgentLifecycle(db).retry(agent.id);
+    await work.process(agent.id);
+    expect(await runStatus(run.id)).toBe("running");
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    await createAgentLifecycle(db).retry(agent.id);
+    await work.process(agent.id);
+    expect(await runStatus(run.id)).toBe("succeeded");
+    expect((await current(agent.id)).lifecycleState).toBe("ready");
+  });
+
+  it("still cancels the running run when a manual hold joins the company pause", async () => {
+    const { agent, run, work } = await readyAgentWithRunningRun();
+    await setCompanyStatus("paused");
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await createAgentLifecycle(db).retry(agent.id);
+    await work.process(agent.id);
+    expect(await runStatus(run.id)).toBe("cancelled");
+  });
+
   it("retains company data until every agent finishes termination", async () => {
     const agent = await hire();
     const [project] = await db.insert(projects).values({ companyId, name: "Keep until cleanup", leadAgentId: agent.id }).returning();

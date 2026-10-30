@@ -158,23 +158,29 @@ function agentActor(): Actor {
 
 // Minimal chainable/thenable db stub: any query resolves to an empty row set.
 // Run containment is mocked because this suite targets assignee invokability.
-function stubDb(): any {
-  const query: any = {};
-  for (const method of ["select", "from", "where", "innerJoin", "leftJoin", "orderBy", "limit", "groupBy", "for"]) {
-    query[method] = () => query;
-  }
-  query.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve([]));
-  return { select: () => query };
+function stubDb(pausedLifecycle?: Record<string, unknown>): any {
+  const query = (rows: unknown[]): any => {
+    const chain: any = {};
+    for (const method of ["select", "from", "where", "innerJoin", "leftJoin", "orderBy", "limit", "groupBy", "for"]) {
+      chain[method] = () => chain;
+    }
+    chain.then = (resolve: (rows: unknown[]) => unknown) => Promise.resolve(resolve(rows));
+    return chain;
+  };
+  return {
+    select: (projection?: Record<string, unknown>) =>
+      query(pausedLifecycle && projection && "lifecycleHolds" in projection ? [pausedLifecycle] : []),
+  };
 }
 
-function createApp(actor: Actor) {
+function createApp(actor: Actor, pausedLifecycle?: Record<string, unknown>) {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api", issueRoutes(stubDb() as any, {} as any));
+  app.use("/api", issueRoutes(stubDb(pausedLifecycle) as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -243,6 +249,38 @@ describe("issue assignee invokability guard", () => {
     expect(res.body.error).toContain("paused agent");
     expect(mockIssueService.createChild).not.toHaveBeenCalled();
     expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  it("allows an agent to assign to an agent paused only by its company's pause", async () => {
+    const existing = makeIssue();
+    const updated = makeIssue({ assigneeAgentId: PAUSED_AGENT_ID });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(updated);
+
+    const res = await request(createApp(agentActor(), {
+      lifecycleState: "paused", lifecycleHolds: ["company_paused"], lifecycleOperation: { resumeState: "ready" },
+    }))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: PAUSED_AGENT_ID });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a manual hold alongside the company pause", { lifecycleState: "paused", lifecycleHolds: ["company_paused", "manual"], lifecycleOperation: { resumeState: "ready" } }],
+    ["a company pause during setup", { lifecycleState: "pausing", lifecycleHolds: ["company_paused"], lifecycleOperation: { resumeState: "preparing" } }],
+    ["no hold while setup is pending", { lifecycleState: "preparing", lifecycleHolds: [], lifecycleOperation: { resumeState: "ready" } }],
+  ])("refuses an agent assigning to a paused agent with %s", async (_case, lifecycle) => {
+    const existing = makeIssue();
+    mockIssueService.getById.mockResolvedValue(existing);
+
+    const res = await request(createApp(agentActor(), lifecycle))
+      .patch(`/api/issues/${existing.id}`)
+      .send({ assigneeAgentId: PAUSED_AGENT_ID });
+
+    expect(res.status).toBe(409);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("still allows an agent to assign to an invokable agent", async () => {
