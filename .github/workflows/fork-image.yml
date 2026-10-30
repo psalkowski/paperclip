@@ -1,0 +1,160 @@
+name: Fork image
+
+on:
+  push:
+    branches:
+      - "fork/candidate/**"
+    tags:
+      - "fork/v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute build version
+        id: build-version
+        run: |
+          set -euo pipefail
+          version="$(git describe --tags --match 'v*' --long --dirty 2>/dev/null || true)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Stamping build version: ${version:-<none>}"
+
+      - name: Compute tool cache epoch
+        id: tools-epoch
+        run: echo "epoch=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Refresh lockfile for Docker build context
+        run: |
+          set -euo pipefail
+          pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+          changed="$(git status --porcelain)"
+          if [ -z "$changed" ]; then
+            echo "Lockfile already matches package metadata."
+            exit 0
+          fi
+          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
+            echo "Unexpected files changed during lockfile refresh:"
+            echo "$changed"
+            exit 1
+          fi
+          echo "Using refreshed pnpm-lock.yaml in the Docker build context."
+
+      - name: Free runner disk
+        run: |
+          set -euo pipefail
+          sudo apt-get clean || true
+          sudo rm -rf /usr/share/dotnet /usr/share/swift /usr/local/lib/android /usr/local/share/boost \
+            /usr/local/share/powershell /opt/ghc /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/Ruby || true
+          docker system prune -af || true
+          df -h
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Compute schema migration labels
+        id: schema
+        run: |
+          set -euo pipefail
+          last=$(ls packages/db/src/migrations/*.sql | sed 's|.*/||' | LC_ALL=C sort | tail -1)
+          count=$(ls packages/db/src/migrations/*.sql | wc -l | tr -d ' ')
+          echo "last=${last}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.build-version.outputs.version }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            CLI_TOOLS_CACHE_EPOCH=${{ steps.tools-epoch.outputs.epoch }}
+          tags: ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.build-version.outputs.version }}
+            io.github.paperclipai.schema.last-migration=${{ steps.schema.outputs.last }}
+            io.github.paperclipai.schema.migration-count=${{ steps.schema.outputs.count }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}:buildcache-amd64,mode=max
+          push: true
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/fork/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Tag the tested image
+        run: |
+          set -euo pipefail
+          release="${GITHUB_REF#refs/tags/fork/v}"
+          revision="${release##*-}"
+          version="${release%-*}"
+          case "$revision" in ''|*[!0-9]*) echo "Tag ${GITHUB_REF} is not fork/v<version>-<n>"; exit 1;; esac
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          commit="$(git rev-list -n 1 "${GITHUB_REF}")"
+          source="${image}:sha-${commit}"
+          target="${image}:${version}-fork.${revision}"
+          docker buildx imagetools inspect "$source" >/dev/null
+          if docker buildx imagetools inspect "$target" >/dev/null 2>&1; then
+            echo "${target} already exists; release tags are never moved."
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$target" "$source"
+          docker buildx imagetools inspect "$target"
