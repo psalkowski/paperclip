@@ -49,9 +49,11 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
         }
         if (command === "pause") holds = [...new Set([...holds, reason])];
         if (command === "resume") holds = holds.filter(hold => reason === "user" ? ["budget", "company_archived", "company_paused"].includes(hold) : hold !== reason);
+        const liftedBeforeHostStep = !holds.length && agent.lifecycleState === "pausing" && !agent.lifecycleOperation?.hostComplete;
         let next = command === "reconcile"
           ? holds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
-            : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
+            : !holds.length && agent.lifecycleState === "paused" || liftedBeforeHostStep ? "resuming" as const : agent.lifecycleState
+          : command === "resume" && liftedBeforeHostStep ? "resuming" as const
           : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
           : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
         if (command === "complete" && next === "ready" && holds.length) next = "pausing";

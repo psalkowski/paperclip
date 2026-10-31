@@ -41,7 +41,7 @@ These are the only transaction integrations. They are described below.
 | `preparing` | Required plugins prepare the agent. | `verifying` |
 | `verifying` | The host tests the saved harness configuration. | `ready` |
 | `ready` | The lifecycle permits work. | `pausing` or `terminating` |
-| `pausing` | The host stops work. Required plugins stop their resources. | `paused` |
+| `pausing` | The host stops work. Required plugins stop their resources. | `paused`, or `resuming` when every hold is lifted before the host step completes |
 | `paused` | A pause hold prevents work. | `resuming` or `terminating` |
 | `resuming` | Required plugins start their resources. | The state saved before pause |
 | `terminating` | The host revokes keys and stops work. | `cleaning_up` |

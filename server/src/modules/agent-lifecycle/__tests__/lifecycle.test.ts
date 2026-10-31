@@ -287,19 +287,14 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await current(agent.id)).lifecycleState).toBe("ready");
   });
 
-  it("keeps the run when the company resumes before it finishes", async () => {
+  it("returns the agent to ready with its run when the company resumes before the run finishes", async () => {
     const { agent, run, work } = await readyAgentWithRunningRun();
     await setCompanyStatus("paused");
     await work.process(agent.id);
     await setCompanyStatus("active");
-    await createAgentLifecycle(db).retry(agent.id);
     await work.process(agent.id);
     expect(await runStatus(run.id)).toBe("running");
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
-    await createAgentLifecycle(db).retry(agent.id);
-    await work.process(agent.id);
-    expect(await runStatus(run.id)).toBe("succeeded");
-    expect((await current(agent.id)).lifecycleState).toBe("ready");
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleHolds: [], status: "idle", pausedAt: null });
   });
 
   it("still cancels the running run when a manual hold joins the company pause", async () => {
