@@ -1,6 +1,7 @@
 import type { Agent, ProviderQuotaResult, SshEnvironmentConfig } from "@paperclipai/shared";
 
 type QuotaAgent = Pick<Agent, "companyId" | "adapterType" | "defaultEnvironmentId"> & { adapterConfig: unknown };
+import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import { fetchClaudeQuotaOverSsh } from "@paperclipai/adapter-claude-local/server";
 import { fetchCodexQuotaOverSsh } from "@paperclipai/adapter-codex-local/server";
@@ -32,7 +33,7 @@ const unavailable = (provider: string, errorFamily: string, error: string): Prov
 function cacheExpiry(result: ProviderQuotaResult, now: number): number {
   const resets = result.windows
     .map((window) => (window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN))
-    .filter((time) => Number.isFinite(time) && time > now);
+    .filter(Number.isFinite);
   return Math.min(now + CACHE_TTL_MS, ...resets);
 }
 
@@ -60,8 +61,8 @@ async function probe(config: SshEnvironmentConfig, provider: Provider, command: 
   }
 }
 
-function cachedProbe(environmentId: string, config: SshEnvironmentConfig, provider: Provider, command: string) {
-  const key = `${environmentId}:${provider}:${command}`;
+function cachedProbe(target: string, config: SshEnvironmentConfig, provider: Provider, command: string) {
+  const key = `${target}:${provider}:${command}`;
   const now = Date.now();
   const hit = cache.get(key);
   if (hit && hit.expires > now) return hit.result;
@@ -92,9 +93,13 @@ export async function fetchAgentQuotaWindows(db: Db, agent: QuotaAgent): Promise
       unavailable(provider, "unsupported_environment", "Quota is read only on an agent's SSH environment."),
     );
   }
+  const { host, port, username, remoteWorkspacePath } = resolved.config;
+  const target = createHash("sha256")
+    .update(JSON.stringify([agent.companyId, environment.id, environment.updatedAt, host, port, username, remoteWorkspacePath]))
+    .digest("hex");
   return Promise.all(
     PROVIDER_ADAPTERS.map(({ provider }) =>
-      cachedProbe(environment.id, resolved.config, provider, commandFor(agent, provider)),
+      cachedProbe(target, resolved.config, provider, commandFor(agent, provider)),
     ),
   );
 }
