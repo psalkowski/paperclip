@@ -178,7 +178,7 @@ export async function fetchAllQuotaWindows(): Promise<ProviderQuotaResult[]> {
   });
 }
 
-async function withQuotaTimeout(
+export async function withQuotaTimeout(
   adapterType: string,
   task: Promise<ProviderQuotaResult>,
   onTimeout?: () => void,

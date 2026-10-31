@@ -58,6 +58,7 @@ export {
   readCodexToken,
   fetchCodexQuota,
   fetchCodexRpcQuota,
+  fetchCodexQuotaOverSsh,
   mapCodexRpcQuota,
   secondsToWindowLabel,
   fetchWithTimeout,

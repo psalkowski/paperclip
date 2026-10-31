@@ -26,3 +26,4 @@ Upstream's workflows are removed; `.github/workflows/fork-image.yml` is the only
 | A company pause lets running runs finish, keeps company-paused agents assignable, and does not escalate their assigned work as stranded | issue paperclipai/paperclip#18344 | an upstream release makes a company pause graceful |
 | Estimate the API list-price equivalent of Codex subscription runs | — | upstream prices subscription runs |
 | A run that hands its own issue to another agent does not open a reconciliation hold when the issue comes back to its agent | issue paperclipai/paperclip#16057 | an upstream release exempts a self-requested hand-off cancel from the reconciliation hold |
+| Read an agent's subscription quota windows on its SSH environment (`GET /api/agents/:id/quota-windows`), and label Codex windows by their duration | — | upstream reads quota where agents run, and labels Codex windows by duration |

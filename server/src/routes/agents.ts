@@ -122,6 +122,7 @@ import {
 } from "./workspace-command-authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
+import { fetchAgentQuotaWindows } from "../services/agent-quota-windows.js";
 
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { resolvePluginSandboxProviderDriverByKey } from "../services/plugin-environment-driver.js";
@@ -3971,6 +3972,13 @@ export function agentRoutes(
     const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!agent || !(await assertAgentReadAllowed(req, res, agent))) return;
     res.json(await agentIdentityService(db).getPublicIdentity(agent.companyId, agent.id));
+  });
+
+  router.get("/agents/:id/quota-windows", async (req, res) => {
+    const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!agent) return;
+    if (!(await assertAgentReadAllowed(req, res, agent))) return;
+    res.json(await fetchAgentQuotaWindows(db, agent));
   });
 
   router.get("/agents/:id", async (req, res) => {

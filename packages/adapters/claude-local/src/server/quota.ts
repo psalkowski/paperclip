@@ -5,11 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { runSshCommand, shellQuote, type SshConnectionConfig } from "@paperclipai/adapter-utils/ssh";
 
 const execFileAsync = promisify(execFile);
 
 const CLAUDE_USAGE_SOURCE_OAUTH = "anthropic-oauth";
 const CLAUDE_USAGE_SOURCE_CLI = "claude-cli";
+const CLAUDE_USAGE_SOURCE_SSH_SNAPSHOT = "claude-cli-snapshot-ssh";
 
 export function claudeConfigDir(): string {
   const fromEnv = process.env.CLAUDE_CONFIG_DIR;
@@ -271,22 +273,16 @@ export async function fetchWithTimeout(url: string, init: RequestInit, ms = 8000
   }
 }
 
-export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Promise<QuotaWindow[]> {
-  const resp = await fetchWithTimeout("https://api.anthropic.com/api/oauth/usage", {
-    signal,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "anthropic-beta": "oauth-2025-04-20",
-    },
-  });
-  if (!resp.ok) throw new Error(`anthropic usage api returned ${resp.status}`);
-  const body = (await resp.json()) as AnthropicUsageResponse;
+function claudeUsageWindows(
+  body: AnthropicUsageResponse,
+  percent: (utilization: number | null | undefined) => number | null,
+): QuotaWindow[] {
   const windows: QuotaWindow[] = [];
 
   if (body.five_hour != null) {
     windows.push({
       label: "Current session",
-      usedPercent: toPercent(body.five_hour.utilization),
+      usedPercent: percent(body.five_hour.utilization),
       resetsAt: body.five_hour.resets_at ?? null,
       valueLabel: null,
       detail: null,
@@ -295,7 +291,7 @@ export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Pro
   if (body.seven_day != null) {
     windows.push({
       label: "Current week (all models)",
-      usedPercent: toPercent(body.seven_day.utilization),
+      usedPercent: percent(body.seven_day.utilization),
       resetsAt: body.seven_day.resets_at ?? null,
       valueLabel: null,
       detail: null,
@@ -304,7 +300,7 @@ export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Pro
   if (body.seven_day_sonnet != null) {
     windows.push({
       label: "Current week (Sonnet only)",
-      usedPercent: toPercent(body.seven_day_sonnet.utilization),
+      usedPercent: percent(body.seven_day_sonnet.utilization),
       resetsAt: body.seven_day_sonnet.resets_at ?? null,
       valueLabel: null,
       detail: null,
@@ -313,7 +309,7 @@ export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Pro
   if (body.seven_day_opus != null) {
     windows.push({
       label: "Current week (Opus only)",
-      usedPercent: toPercent(body.seven_day_opus.utilization),
+      usedPercent: percent(body.seven_day_opus.utilization),
       resetsAt: body.seven_day_opus.resets_at ?? null,
       valueLabel: null,
       detail: null,
@@ -322,7 +318,7 @@ export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Pro
   if (body.extra_usage != null) {
     windows.push({
       label: "Extra usage",
-      usedPercent: body.extra_usage.is_enabled === false ? null : toPercent(body.extra_usage.utilization),
+      usedPercent: body.extra_usage.is_enabled === false ? null : percent(body.extra_usage.utilization),
       resetsAt: null,
       valueLabel:
         body.extra_usage.is_enabled === false
@@ -335,6 +331,73 @@ export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Pro
     });
   }
   return windows;
+}
+
+export async function fetchClaudeQuota(token: string, signal?: AbortSignal): Promise<QuotaWindow[]> {
+  const resp = await fetchWithTimeout("https://api.anthropic.com/api/oauth/usage", {
+    signal,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    },
+  });
+  if (!resp.ok) throw new Error(`anthropic usage api returned ${resp.status}`);
+  return claudeUsageWindows((await resp.json()) as AnthropicUsageResponse, toPercent);
+}
+
+const SNAPSHOT_CLOCK_SKEW_MS = 120_000;
+const SSH_USAGE_PROBE_TIMEOUT_MS = 45_000;
+
+export class ClaudeUsageSnapshotError extends Error {
+  constructor(
+    message: string,
+    readonly errorFamily: "stale_snapshot" | "unrecognized_snapshot",
+  ) {
+    super(message);
+    this.name = "ClaudeUsageSnapshotError";
+  }
+}
+
+const exactPercent = (utilization: number | null | undefined) =>
+  typeof utilization === "number" && Number.isFinite(utilization) ? Math.max(0, Math.min(100, utilization)) : null;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+export function parseClaudeUsageSnapshot(raw: string, probeStartedAtMs: number): { windows: QuotaWindow[]; capturedAt: string } {
+  let snapshot: unknown;
+  try {
+    snapshot = JSON.parse(raw);
+  } catch {
+    throw new ClaudeUsageSnapshotError("Claude usage snapshot is not JSON", "unrecognized_snapshot");
+  }
+  if (!isRecord(snapshot) || typeof snapshot.fetchedAtMs !== "number" || !isRecord(snapshot.utilization)) {
+    throw new ClaudeUsageSnapshotError("Claude usage snapshot has no fetch time or utilization", "unrecognized_snapshot");
+  }
+  const capturedAt = new Date(snapshot.fetchedAtMs).toISOString();
+  if (snapshot.fetchedAtMs < probeStartedAtMs - SNAPSHOT_CLOCK_SKEW_MS) {
+    throw new ClaudeUsageSnapshotError(`Claude usage snapshot is stale (fetched ${capturedAt})`, "stale_snapshot");
+  }
+  const body = snapshot.utilization;
+  if (!("five_hour" in body) || !isRecord(body.seven_day)) {
+    throw new ClaudeUsageSnapshotError("Claude usage snapshot has no five-hour or weekly window", "unrecognized_snapshot");
+  }
+  const windows = claudeUsageWindows(body as AnthropicUsageResponse, exactPercent);
+  if (body.five_hour === null) {
+    windows.unshift({ label: "Current session", usedPercent: 0, resetsAt: null, valueLabel: null, detail: "no active window" });
+  }
+  return { windows, capturedAt };
+}
+
+export async function fetchClaudeQuotaOverSsh(config: SshConnectionConfig, command = "claude"): Promise<ProviderQuotaResult> {
+  const probeStartedAtMs = Date.now();
+  const { stdout } = await runSshCommand(
+    config,
+    `${shellQuote(command)} -p /usage --no-session-persistence --output-format json >/dev/null 2>&1; plutil -extract cachedUsageUtilization json -o - "$HOME/.claude.json"`,
+    { timeoutMs: SSH_USAGE_PROBE_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+  );
+  const { windows, capturedAt } = parseClaudeUsageSnapshot(stdout, probeStartedAtMs);
+  return { provider: "anthropic", source: CLAUDE_USAGE_SOURCE_SSH_SNAPSHOT, ok: true, windows, capturedAt };
 }
 
 function usageOutputLooksRelevant(text: string): boolean {

@@ -9,6 +9,7 @@ import {
   fetchWithTimeout,
   fetchClaudeQuota,
   parseClaudeCliUsageText,
+  parseClaudeUsageSnapshot,
   readClaudeToken,
   claudeConfigDir,
 } from "@paperclipai/adapter-claude-local/server";
@@ -699,7 +700,7 @@ describe("fetchCodexQuota", () => {
     });
     const windows = await fetchCodexQuota("token", null);
     expect(windows).toHaveLength(1);
-    expect(windows[0]).toMatchObject({ label: "5h limit", usedPercent: 30, resetsAt: "2026-01-02T00:00:00.000Z" });
+    expect(windows[0]).toMatchObject({ label: "24h limit", usedPercent: 30, resetsAt: "2026-01-02T00:00:00.000Z" });
   });
 
   it("parses secondary_window alongside primary_window", async () => {
@@ -823,6 +824,27 @@ describe("mapCodexRpcQuota", () => {
       },
     ]);
   });
+
+  it("labels a window by its duration, so a weekly limit reported as primary stays weekly", () => {
+    const snapshot = mapCodexRpcQuota({
+      rateLimits: {
+        limitId: "codex",
+        primary: { usedPercent: 71.5, windowDurationMins: 10_080, resetsAt: 1_793_775_737 },
+        secondary: null,
+        planType: "pro",
+      },
+    });
+
+    expect(snapshot.windows).toEqual([
+      {
+        label: "Weekly limit",
+        usedPercent: 71.5,
+        resetsAt: "2026-11-04T07:02:17.000Z",
+        valueLabel: null,
+        detail: null,
+      },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -883,5 +905,47 @@ describe("fetchWithTimeout", () => {
     const promise = fetchWithTimeout("https://example.com", {}, 1000);
     vi.advanceTimersByTime(1001);
     await expect(promise).rejects.toThrow("aborted");
+  });
+});
+
+describe("parseClaudeUsageSnapshot", () => {
+  const probeStartedAtMs = Date.parse("2026-10-31T08:29:50.000Z");
+  const snapshot = (fetchedAtMs: number, utilization: Record<string, unknown>) =>
+    JSON.stringify({ fetchedAtMs, accountUuid: "account", utilization });
+  const weekly = { utilization: 55.4, resets_at: "2026-10-31T19:59:59.632827+00:00" };
+
+  it("keeps exact percentages and reports a null five-hour window as an inactive session", () => {
+    const fetchedAtMs = Date.parse("2026-10-31T08:29:53.706Z");
+    const parsed = parseClaudeUsageSnapshot(
+      snapshot(fetchedAtMs, { five_hour: null, seven_day: weekly, seven_day_sonnet: null, seven_day_opus: null }),
+      probeStartedAtMs,
+    );
+
+    expect(parsed.capturedAt).toBe("2026-10-31T08:29:53.706Z");
+    expect(parsed.windows).toEqual([
+      { label: "Current session", usedPercent: 0, resetsAt: null, valueLabel: null, detail: "no active window" },
+      {
+        label: "Current week (all models)",
+        usedPercent: 55.4,
+        resetsAt: "2026-10-31T19:59:59.632827+00:00",
+        valueLabel: null,
+        detail: null,
+      },
+    ]);
+  });
+
+  it("refuses a snapshot fetched before the probe started, which the CLI serves when its own fetch failed", () => {
+    expect(() =>
+      parseClaudeUsageSnapshot(
+        snapshot(Date.parse("2026-10-31T07:50:00.000Z"), { five_hour: null, seven_day: weekly }),
+        probeStartedAtMs,
+      ),
+    ).toThrow(expect.objectContaining({ errorFamily: "stale_snapshot" }));
+  });
+
+  it("refuses a snapshot without a five-hour key instead of reading it as an idle window", () => {
+    expect(() =>
+      parseClaudeUsageSnapshot(snapshot(probeStartedAtMs, { seven_day: weekly }), probeStartedAtMs),
+    ).toThrow(expect.objectContaining({ errorFamily: "unrecognized_snapshot" }));
   });
 });

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "@paperclipai/adapter-utils/ssh";
 import {
   classifyCodexAuthRefreshFailure,
   type CodexAuthRefreshFailureClass,
@@ -10,6 +11,7 @@ import {
 
 const CODEX_USAGE_SOURCE_RPC = "codex-rpc";
 const CODEX_USAGE_SOURCE_WHAM = "codex-wham";
+const CODEX_USAGE_SOURCE_SSH_RPC = "codex-rpc-ssh";
 const MAX_QUOTA_ERROR_BODY_BYTES = 4_000;
 const MAX_RPC_FRAME_BYTES = 64 * 1024;
 const RPC_SHUTDOWN_GRACE_MS = 250;
@@ -279,6 +281,32 @@ function normalizeCodexUsedPercent(rawPct: number | null | undefined): number | 
   return Math.max(0, Math.min(100, rawPct));
 }
 
+const WEEK_MINUTES = 7 * 24 * 60;
+
+function codexLimitLabel(windowMinutes: number | null | undefined, positionalLabel: string): string {
+  if (typeof windowMinutes !== "number" || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+    return positionalLabel;
+  }
+  if (windowMinutes === WEEK_MINUTES) return "Weekly limit";
+  if (windowMinutes > 24 * 60 && windowMinutes % (24 * 60) === 0) return `${windowMinutes / (24 * 60)}d limit`;
+  if (windowMinutes % 60 === 0) return `${windowMinutes / 60}h limit`;
+  return `${windowMinutes}m limit`;
+}
+
+function whamWindow(window: WhamWindow, positionalLabel: string): QuotaWindow {
+  const seconds = window.limit_window_seconds;
+  return {
+    label: codexLimitLabel(typeof seconds === "number" ? seconds / 60 : null, positionalLabel),
+    usedPercent: normalizeCodexUsedPercent(window.used_percent),
+    resetsAt:
+      typeof window.reset_at === "number"
+        ? unixSecondsToIso(window.reset_at)
+        : (window.reset_at ?? null),
+    valueLabel: null,
+    detail: null,
+  };
+}
+
 export async function fetchCodexQuota(
   token: string,
   accountId: string | null,
@@ -303,32 +331,8 @@ export async function fetchCodexQuota(
   const windows: QuotaWindow[] = [];
 
   const rateLimit = body.rate_limit;
-  if (rateLimit?.primary_window != null) {
-    const w = rateLimit.primary_window;
-    windows.push({
-      label: "5h limit",
-      usedPercent: normalizeCodexUsedPercent(w.used_percent),
-      resetsAt:
-        typeof w.reset_at === "number"
-          ? unixSecondsToIso(w.reset_at)
-          : (w.reset_at ?? null),
-      valueLabel: null,
-      detail: null,
-    });
-  }
-  if (rateLimit?.secondary_window != null) {
-    const w = rateLimit.secondary_window;
-    windows.push({
-      label: "Weekly limit",
-      usedPercent: normalizeCodexUsedPercent(w.used_percent),
-      resetsAt:
-        typeof w.reset_at === "number"
-          ? unixSecondsToIso(w.reset_at)
-          : (w.reset_at ?? null),
-      valueLabel: null,
-      detail: null,
-    });
-  }
+  if (rateLimit?.primary_window != null) windows.push(whamWindow(rateLimit.primary_window, "5h limit"));
+  if (rateLimit?.secondary_window != null) windows.push(whamWindow(rateLimit.secondary_window, "Weekly limit"));
   if (body.credits != null && body.credits.unlimited !== true) {
     const balance = body.credits.balance;
     const valueLabel = balance != null ? `$${(balance / 100).toFixed(2)} remaining` : "N/A";
@@ -389,10 +393,10 @@ function unixSecondsToIso(value: number | null | undefined): string | null {
   return new Date(value * 1000).toISOString();
 }
 
-function buildCodexRpcWindow(label: string, window: CodexRpcWindow | null | undefined): QuotaWindow | null {
+function buildCodexRpcWindow(prefix: string, positionalLabel: string, window: CodexRpcWindow | null | undefined): QuotaWindow | null {
   if (!window) return null;
   return {
-    label,
+    label: `${prefix}${codexLimitLabel(window.windowDurationMins, positionalLabel)}`,
     usedPercent: normalizeCodexUsedPercent(window.usedPercent),
     resetsAt: unixSecondsToIso(window.resetsAt),
     valueLabel: null,
@@ -437,9 +441,9 @@ export function mapCodexRpcQuota(result: CodexRpcRateLimitsResult, account?: Cod
       limitId === "codex"
         ? ""
         : `${limit.limitName ?? limitId} · `;
-    const primary = buildCodexRpcWindow(`${prefix}5h limit`, limit.primary);
+    const primary = buildCodexRpcWindow(prefix, "5h limit", limit.primary);
     if (primary) windows.push(primary);
-    const secondary = buildCodexRpcWindow(`${prefix}Weekly limit`, limit.secondary);
+    const secondary = buildCodexRpcWindow(prefix, "Weekly limit", limit.secondary);
     if (secondary) windows.push(secondary);
     if (limitId === "codex" && limit.credits && limit.credits.unlimited !== true) {
       windows.push({
@@ -471,15 +475,27 @@ type PendingRequest = {
   timer: NodeJS.Timeout;
 };
 
-class CodexRpcClient {
-  private proc = spawn(
-    "codex",
-    // Only account-read RPCs are sent; no agent turn is started. Keep the
-    // read-only sandbox and use the approval policy supported by current CLIs.
-    ["-s", "read-only", "-a", "on-request", "app-server"],
-    { stdio: ["pipe", "pipe", "pipe"], env: process.env },
-  );
+// Only account-read RPCs are sent; no agent turn is started. Keep the
+// read-only sandbox and use the approval policy supported by current CLIs.
+const CODEX_APP_SERVER_ARGS = ["-s", "read-only", "-a", "on-request", "app-server"];
+const LOCAL_RPC_REQUEST_TIMEOUT_MS = 6_000;
+const SSH_RPC_REQUEST_TIMEOUT_MS = 20_000;
 
+interface CodexRpcTarget {
+  command: string;
+  args: string[];
+  requestTimeoutMs: number;
+}
+
+const LOCAL_CODEX_RPC_TARGET: CodexRpcTarget = {
+  command: "codex",
+  args: CODEX_APP_SERVER_ARGS,
+  requestTimeoutMs: LOCAL_RPC_REQUEST_TIMEOUT_MS,
+};
+
+class CodexRpcClient {
+  private proc;
+  private readonly requestTimeoutMs: number;
   private nextId = 1;
   private buffer = "";
   private pending = new Map<number, PendingRequest>();
@@ -487,7 +503,9 @@ class CodexRpcClient {
   private failure: Error | null = null;
   private closed = false;
 
-  constructor() {
+  constructor(target: CodexRpcTarget) {
+    this.requestTimeoutMs = target.requestTimeoutMs;
+    this.proc = spawn(target.command, target.args, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
@@ -556,7 +574,7 @@ class CodexRpcClient {
     }
   }
 
-  private request(method: string, params: Record<string, unknown> = {}, timeoutMs = 6_000): Promise<Record<string, unknown>> {
+  private request(method: string, params: Record<string, unknown> = {}, timeoutMs = this.requestTimeoutMs): Promise<Record<string, unknown>> {
     if (this.failure) return Promise.reject(this.failure);
     const id = this.nextId++;
     const payload = JSON.stringify({ id, method, params }) + "\n";
@@ -633,8 +651,8 @@ class CodexRpcClient {
   }
 }
 
-export async function fetchCodexRpcQuota(): Promise<CodexRpcQuotaSnapshot> {
-  const client = new CodexRpcClient();
+export async function fetchCodexRpcQuota(target: CodexRpcTarget = LOCAL_CODEX_RPC_TARGET): Promise<CodexRpcQuotaSnapshot> {
+  const client = new CodexRpcClient(target);
   try {
     await client.initialize();
     const [limits, account] = await Promise.all([
@@ -644,6 +662,22 @@ export async function fetchCodexRpcQuota(): Promise<CodexRpcQuotaSnapshot> {
     return mapCodexRpcQuota(limits, account);
   } finally {
     await client.shutdown();
+  }
+}
+
+export async function fetchCodexQuotaOverSsh(spec: SshRemoteExecutionSpec, command = "codex"): Promise<ProviderQuotaResult> {
+  const target = await buildSshSpawnTarget({ spec, command, args: CODEX_APP_SERVER_ARGS, env: {} });
+  try {
+    const snapshot = await fetchCodexRpcQuota({ ...target, requestTimeoutMs: SSH_RPC_REQUEST_TIMEOUT_MS });
+    return {
+      provider: "openai",
+      source: CODEX_USAGE_SOURCE_SSH_RPC,
+      ok: true,
+      windows: snapshot.windows,
+      capturedAt: new Date().toISOString(),
+    };
+  } finally {
+    await target.cleanup();
   }
 }
 

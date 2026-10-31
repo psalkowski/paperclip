@@ -3642,6 +3642,15 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/agents/{id}/quota-windows",
+  tags: ["agents"],
+  summary: "Read the subscription quota windows of the agent's environment",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/agents/{id}/identity",
   tags: ["agents"],
   summary: "Get an agent's public cryptographic identity, or null before provisioning",
