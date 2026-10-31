@@ -17,6 +17,15 @@ import { issueService } from "./issues.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+function isAcknowledgedSelfRequestedHandoff(
+  run: Pick<Run, "status" | "errorCode" | "resultJson">,
+): boolean {
+  return run.status === "cancelled" && run.errorCode === "issue_reassigned" &&
+    run.resultJson?.reassignmentStopConfirmed === true &&
+    run.resultJson.reassignmentRequestedByRun === true &&
+    (run.resultJson.executionCancellation as Record<string, unknown> | undefined)?.state === "acknowledged";
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
@@ -31,6 +40,7 @@ export function legacyExecutionNeedsReconciliation(
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;
+  if (isAcknowledgedSelfRequestedHandoff(run)) return false;
   // Productive turn-budget continuation is not a failed provider session.
   if (normalizeMaxTurnStopReason(run.resultJson?.stopReason) ?? normalizeMaxTurnStopReason(run.errorCode)) return false;
   const evidence = run.resultJson?.executionRecovery as

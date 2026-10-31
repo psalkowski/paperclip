@@ -25,3 +25,4 @@ Upstream's workflows are removed; `.github/workflows/fork-image.yml` is the only
 | Let stranded SSH leases on one host be recovered and released | paperclipai/paperclip#15698 (issue paperclipai/paperclip#15676) | an upstream release contains paperclipai/paperclip#15698 or another fix for paperclipai/paperclip#15676 |
 | A company pause lets running runs finish, keeps company-paused agents assignable, and does not escalate their assigned work as stranded | issue paperclipai/paperclip#18344 | an upstream release makes a company pause graceful |
 | Estimate the API list-price equivalent of Codex subscription runs | — | upstream prices subscription runs |
+| A run that hands its own issue to another agent does not open a reconciliation hold when the issue comes back to its agent | issue paperclipai/paperclip#16057 | an upstream release exempts a self-requested hand-off cancel from the reconciliation hold |

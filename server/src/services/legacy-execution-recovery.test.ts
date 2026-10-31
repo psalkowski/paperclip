@@ -107,3 +107,24 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
 });
+
+it("exempts a hand-off that the stopped run requested itself, only once its cancellation is acknowledged", () => {
+  const handedOff = {
+    runtimeMode: "legacy", status: "cancelled", errorCode: "issue_reassigned",
+    resultJson: {
+      reassignmentStopConfirmed: true, reassignmentRequestedByRun: true,
+      executionCancellation: { state: "acknowledged" },
+    },
+  };
+  expect(legacyExecutionNeedsReconciliation(handedOff)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOff, resultJson: {
+    ...handedOff.resultJson, executionCancellation: { state: "requested" },
+  } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOff, resultJson: {
+    reassignmentStopConfirmed: true, executionCancellation: { state: "acknowledged" },
+  } })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOff, errorCode: "cancelled" })).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...handedOff, resultJson: {
+    ...handedOff.resultJson, workspaceRestoreFailure: "restore_unsafe_archive",
+  } })).toBe(true);
+});
