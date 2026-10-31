@@ -9,8 +9,10 @@ import {
   adapterExecutionTargetUsesManagedHome,
   ensureAdapterExecutionTargetRuntimeCommandInstalled,
   resolveAdapterExecutionTargetCwd,
+  restoreRemoteWorkspaceAfterExecution,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
+  type AdapterExecutionTarget,
 } from "./execution-target.js";
 
 describe("runAdapterExecutionTargetShellCommand", () => {
@@ -466,5 +468,38 @@ describe("GitHub launcher lifecycle", () => {
       cwd: "/remote/workspace", timeoutMs: 5_000 });
     await expect(cleanupGitHubOperationLaunchers({ runId: "../other", target })).rejects.toThrow("Invalid GitHub launcher run ID");
     expect(runner.execute).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("restoreRemoteWorkspaceAfterExecution", () => {
+  const failedRestore = async () => {
+    throw new Error("fatal: early EOF");
+  };
+
+  it("leaves a warning that names where the run's work stayed when an SSH copy-back fails", async () => {
+    const logs: string[] = [];
+    await expect(restoreRemoteWorkspaceAfterExecution({
+      target: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/remote/workspace",
+        spec: { host: "agent-host", port: 22, username: "agent" },
+      } as unknown as AdapterExecutionTarget,
+      remoteDir: "/remote/workspace/.paperclip-runtime/runs/run-1/workspace",
+      restore: failedRestore,
+      onLog: async (_stream, chunk) => {
+        logs.push(chunk);
+      },
+    })).resolves.toEqual({ workspaceRestoreWarning: "ssh_copy_back_failed" });
+    expect(logs.at(-1)).toContain("this run's work stays in /remote/workspace/.paperclip-runtime/runs/run-1/workspace there. fatal: early EOF");
+  });
+
+  it("still fails when a sandbox copy-back fails, since the sandbox may not keep the workspace", async () => {
+    await expect(restoreRemoteWorkspaceAfterExecution({
+      target: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace" } as unknown as AdapterExecutionTarget,
+      remoteDir: "/workspace",
+      restore: failedRestore,
+      onLog: async () => {},
+    })).rejects.toThrow("fatal: early EOF");
   });
 });

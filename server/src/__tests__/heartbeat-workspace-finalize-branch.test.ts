@@ -536,4 +536,31 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       },
     });
   }, 20_000);
+
+  it("keeps a successful run succeeded when its SSH workspace copy-back left a warning", async () => {
+    const repoRoot = await createGitRepo();
+    tempRoots.push(repoRoot);
+    const { agentId, issueId } = await seedRunTarget(db, repoRoot);
+    adapterExecute.mockImplementationOnce(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      summary: "Adapter completed; its SSH copy-back failed.",
+      provider: "test",
+      model: "test-model",
+      resultJson: { workspaceRestoreWarning: "ssh_copy_back_failed" },
+    }));
+
+    const heartbeat = heartbeatService(db);
+    const run = await wakeIssue(heartbeat, agentId, issueId);
+    expect(run).not.toBeNull();
+
+    const finishedRun = await waitForRunToFinish(heartbeat, run!.id);
+    expect(finishedRun).toMatchObject({ status: "succeeded", errorCode: null, error: null });
+    expect(finishedRun?.resultJson).toMatchObject({ workspaceRestoreWarning: "ssh_copy_back_failed" });
+    await waitForRuntimeStateLastRun(db, agentId, run!.id);
+    const finalizeOps = await listFinalizeOperations(db, run!.id);
+    expect(finalizeOps).toHaveLength(1);
+    expect(finalizeOps[0]).toMatchObject({ status: "succeeded" });
+  }, 20_000);
 });

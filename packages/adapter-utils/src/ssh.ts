@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
 import {
   createUnrelatedHistoryGraftCommit,
@@ -708,7 +709,7 @@ async function streamSshToLocalFile(input: {
   remoteScript: string;
   localFile: string;
   progress?: TransferProgress;
-}): Promise<void> {
+}): Promise<string> {
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [
     ...auth.args,
@@ -718,46 +719,38 @@ async function streamSshToLocalFile(input: {
     `sh -c ${shellQuote(input.remoteScript)}`,
   ];
 
-  await new Promise<void>((resolve, reject) => {
+  try {
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const sink = createWriteStream(input.localFile, { mode: 0o600 });
-
     let sshStderr = "";
-    let settled = false;
-
-    const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
-      ssh.kill("SIGTERM");
-      sink.destroy();
-      reject(error);
-    };
-
-    if (input.progress) {
-      input.progress.counter.on("error", fail);
-      ssh.stdout?.pipe(input.progress.counter).pipe(sink);
-    } else {
-      ssh.stdout?.pipe(sink);
-    }
-    ssh.stderr?.on("data", (chunk) => {
+    ssh.stderr.on("data", (chunk) => {
       sshStderr += String(chunk);
     });
-    ssh.on("error", fail);
-    sink.on("error", fail);
-    ssh.on("close", (code) => {
-      sink.end(() => {
-        if (settled) return;
-        settled = true;
-        if ((code ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`));
-          return;
-        }
-        resolve();
-      });
+    const exited = new Promise<number | null>((resolve, reject) => {
+      ssh.on("error", reject);
+      ssh.on("close", resolve);
     });
-  }).finally(auth.cleanup);
+    const sink = createWriteStream(input.localFile, { mode: 0o600 });
+    const written = input.progress
+      ? pipeline(ssh.stdout, input.progress.counter, sink)
+      : pipeline(ssh.stdout, sink);
+
+    let code: number | null;
+    try {
+      [, code] = await Promise.all([written, exited]);
+    } catch (error) {
+      ssh.kill("SIGTERM");
+      ssh.stdout.destroy();
+      throw error;
+    }
+    if ((code ?? 0) !== 0) {
+      throw new Error(sshStderr.trim() || `ssh exited with code ${code ?? -1}`);
+    }
+    return sshStderr;
+  } finally {
+    await auth.cleanup();
+  }
 }
 
 async function importGitWorkspaceToSsh(input: {
@@ -844,6 +837,50 @@ async function importGitWorkspaceToSsh(input: {
   }
 }
 
+const BUNDLE_SIZE_MARKER = "paperclip-bundle-bytes=";
+const GIT_EXPORT_ATTEMPTS = 3;
+
+async function transferGitBundleFromSsh(input: {
+  spec: SshRemoteExecutionSpec;
+  exportScript: string;
+  bundlePath: string;
+  onProgress?: RuntimeProgressSink;
+}): Promise<void> {
+  const progress = input.onProgress
+    ? createTransferProgress({
+      onProgress: input.onProgress,
+      phase: "Exporting git history",
+      direction: "from",
+      totalBytes: null,
+      estimated: false,
+    })
+    : null;
+
+  let stderr: string;
+  try {
+    stderr = await streamSshToLocalFile({
+      spec: input.spec,
+      remoteScript: input.exportScript,
+      localFile: input.bundlePath,
+      progress: progress ?? undefined,
+    });
+    await progress?.finish();
+  } catch (error) {
+    await progress?.fail();
+    throw error;
+  }
+
+  const reportedSize = stderr.match(new RegExp(`${BUNDLE_SIZE_MARKER}(\\d+)`))?.[1];
+  if (reportedSize === undefined) {
+    throw new Error("Git history export from ssh did not report the bundle size.");
+  }
+  const expectedBytes = Number(reportedSize);
+  const receivedBytes = (await fs.stat(input.bundlePath)).size;
+  if (receivedBytes !== expectedBytes) {
+    throw new Error(`Git history export from ssh received ${receivedBytes} of ${expectedBytes} bundle bytes.`);
+  }
+}
+
 async function exportGitWorkspaceFromSsh(input: {
   spec: SshRemoteExecutionSpec;
   remoteDir: string;
@@ -865,38 +902,33 @@ async function exportGitWorkspaceFromSsh(input: {
       'cleanup() { rm -f "$tmp_bundle"; git -C ' + shellQuote(input.remoteDir) + ' update-ref -d refs/paperclip/ssh-sync/export >/dev/null 2>&1 || true; }',
       'trap cleanup EXIT',
       `git -C ${shellQuote(input.remoteDir)} bundle create "$tmp_bundle" refs/paperclip/ssh-sync/export >/dev/null`,
+      `printf '${BUNDLE_SIZE_MARKER}%s\\n' "$(wc -c < "$tmp_bundle" | tr -d ' ')" >&2`,
       'cat "$tmp_bundle"',
     ].join("\n");
 
-    // The remote bundle size isn't known before streaming, so report bytes
-    // received (MB mode) with a terminal completion line.
-    const progress = input.onProgress
-      ? createTransferProgress({
-        onProgress: input.onProgress,
-        phase: "Exporting git history",
-        direction: "from",
-        totalBytes: null,
-        estimated: false,
-      })
-      : null;
-
-    try {
-      await streamSshToLocalFile({
-        spec: input.spec,
-        remoteScript: exportScript,
-        localFile: bundlePath,
-        progress: progress ?? undefined,
-      });
-      await progress?.finish();
-    } catch (error) {
-      await progress?.fail();
-      throw error;
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await transferGitBundleFromSsh({
+          spec: input.spec,
+          exportScript,
+          bundlePath,
+          onProgress: input.onProgress,
+        });
+        await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
+          timeout: 60_000,
+          maxBuffer: 1024 * 1024,
+        });
+        break;
+      } catch (error) {
+        if (attempt === GIT_EXPORT_ATTEMPTS) throw error;
+        await input.onProgress?.(
+          `[paperclip] Exporting git history from ssh failed (attempt ${attempt} of ${GIT_EXPORT_ATTEMPTS}), retrying: ${
+            error instanceof Error ? error.message.trim() : String(error)
+          }\n`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
+      }
     }
-
-    await runLocalGit(input.localDir, ["fetch", "--force", bundlePath, `refs/paperclip/ssh-sync/export:${importedRef}`], {
-      timeout: 60_000,
-      maxBuffer: 1024 * 1024,
-    });
     if (input.resetLocalWorkspace !== false) {
       await runLocalGit(input.localDir, ["reset", "--hard", importedRef], {
         timeout: 60_000,

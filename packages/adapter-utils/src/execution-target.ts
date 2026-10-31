@@ -26,6 +26,7 @@ import type {
 } from "./sandbox-managed-runtime.js";
 import type { GitWorkspaceSnapshot } from "./git-workspace-sync.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
+import type { AdapterExecutionResult } from "./types.js";
 export { resolveReferencedSourceIgnore } from "./sandbox-managed-runtime.js";
 export type {
   AdditionalSourceStagingFailure,
@@ -557,6 +558,41 @@ export function describeAdapterExecutionTarget(
     return `SSH environment ${target.spec.username}@${target.spec.host}:${target.spec.port}`;
   }
   return `sandbox environment${target.providerKey ? ` (${target.providerKey})` : ""}`;
+}
+
+export interface RemoteWorkspaceRestoreWarning {
+  workspaceRestoreWarning: "ssh_copy_back_failed";
+}
+
+export async function restoreRemoteWorkspaceAfterExecution(input: {
+  target: AdapterExecutionTarget | null | undefined;
+  remoteDir: string;
+  restore: () => Promise<void>;
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<RemoteWorkspaceRestoreWarning | null> {
+  const targetDescription = describeAdapterExecutionTarget(input.target);
+  await input.onLog("stdout", `[paperclip] Restoring workspace changes from ${targetDescription}.\n`);
+  try {
+    await input.restore();
+    return null;
+  } catch (error) {
+    const sshTargetKeepsRunWorkspace = input.target?.kind === "remote" && input.target.transport === "ssh";
+    if (!sshTargetKeepsRunWorkspace) throw error;
+    await input.onLog(
+      "stderr",
+      `[paperclip] Workspace changes were not restored from ${targetDescription}; this run's work stays in ${input.remoteDir} there. ${
+        error instanceof Error ? error.message.trim() : String(error)
+      }\n`,
+    );
+    return { workspaceRestoreWarning: "ssh_copy_back_failed" };
+  }
+}
+
+export function withRemoteWorkspaceRestoreWarning(
+  result: AdapterExecutionResult,
+  warning: RemoteWorkspaceRestoreWarning | null,
+): AdapterExecutionResult {
+  return warning ? { ...result, resultJson: { ...result.resultJson, ...warning } } : result;
 }
 
 export type AdapterExecutionTargetTimeoutSource =

@@ -231,6 +231,45 @@ describe("claude remote execution", () => {
     }));
   });
 
+  it("keeps a successful remote run succeeded with a restore warning when the SSH copy-back fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-restore-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+    restoreWorkspaceFromSshExecution.mockRejectedValueOnce(new Error("fatal: early EOF"));
+    const stderr: string[] = [];
+
+    const result = await execute({
+      runId: "run-restore",
+      agent: { id: "agent-1", companyId: "company-1", name: "Claude Coder", adapterType: "claude_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "claude" },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async (stream, chunk) => {
+        if (stream === "stderr") stderr.push(chunk);
+      },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorMessage ?? null).toBeNull();
+    expect(result.resultJson?.workspaceRestoreWarning).toBe("ssh_copy_back_failed");
+    expect(stderr.join("")).toContain(
+      "this run's work stays in /remote/workspace/.paperclip-runtime/runs/run-restore/workspace there. fatal: early EOF",
+    );
+  });
+
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-resume-"));
     cleanupDirs.push(rootDir);

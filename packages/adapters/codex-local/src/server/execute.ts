@@ -28,9 +28,12 @@ import {
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
+  restoreRemoteWorkspaceAfterExecution,
   runAdapterExecutionTargetProcess,
   runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
+  withRemoteWorkspaceRestoreWarning,
+  type RemoteWorkspaceRestoreWarning,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -1587,7 +1590,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     let executionError: unknown = null;
-    try {
+    const runProvider = async (): Promise<AdapterExecutionResult> => {
       const initial = await runAttempt(sessionId);
       if (
         sessionId &&
@@ -1616,6 +1619,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         executionError = new Error(result.errorMessage);
       }
       return result;
+    };
+
+    let providerResult: AdapterExecutionResult | null = null;
+    let restoreWarning: RemoteWorkspaceRestoreWarning | null = null;
+    try {
+      providerResult = await runProvider();
     } catch (error) {
       executionError = error;
       throw error;
@@ -1628,11 +1637,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
         if (restoreRemoteWorkspace) {
           try {
-            await onLog(
-              "stdout",
-              `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-            );
-            await restoreRemoteWorkspace();
+            restoreWarning = await restoreRemoteWorkspaceAfterExecution({
+              target: executionTarget,
+              remoteDir: effectiveExecutionCwd,
+              restore: restoreRemoteWorkspace,
+              onLog,
+            });
           } catch (error) {
             await Promise.resolve(
               onLog(
@@ -1650,6 +1660,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
     }
+    return withRemoteWorkspaceRestoreWarning(providerResult, restoreWarning);
   } finally {
     // Remove the staged CODEX_HOME allowlist temp dir on every exit path
     // (teardown AND error), never only the happy path. Cleanup failure is

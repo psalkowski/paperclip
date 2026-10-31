@@ -213,7 +213,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       runtimeRootDir: REMOTE_RUNTIME_ROOT, assetDirs: { home: `${REMOTE_RUNTIME_ROOT}/home` },
       restoreWorkspace: async () => { order.push("restore"); throw new Error("restore failed"); },
     }));
-    await expect(runTeardown({ sandboxAuth: "{}", hostAuth: "{}", onProviderStopped: async () => { order.push("collect"); } })).rejects.toThrow("restore failed");
+    await runTeardown({ sandboxAuth: "{}", hostAuth: "{}", onProviderStopped: async () => { order.push("collect"); } });
     expect(order).toEqual(["collect", "restore"]);
   });
 
@@ -292,7 +292,7 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
     }
   });
 
-  it("surfaces workspace restore failure after successful provider execution", async () => {
+  it("keeps a successful SSH run with a workspace restore warning when its copy-back fails", async () => {
     prepareAdapterExecutionTargetRuntime.mockResolvedValueOnce({
       target: { kind: "remote", transport: "ssh" },
       workspaceRemoteDir: "/remote/workspace",
@@ -303,12 +303,13 @@ describe("codex execute — outbound auth copy-back restore contribution", () =>
       },
     });
 
-    await expect(
-      runTeardown({
-        sandboxAuth: subscriptionAuth({ accountId: "acct", marker: "sandbox" }),
-        hostAuth: subscriptionAuth({ accountId: "acct", marker: "host" }),
-      }),
-    ).rejects.toThrow("workspace copy-back failed");
+    const { executionResult } = await runTeardown({
+      sandboxAuth: subscriptionAuth({ accountId: "acct", marker: "sandbox" }),
+      hostAuth: subscriptionAuth({ accountId: "acct", marker: "host" }),
+    });
+
+    expect(executionResult.errorMessage ?? null).toBeNull();
+    expect(executionResult.resultJson?.workspaceRestoreWarning).toBe("ssh_copy_back_failed");
   });
 
   it("preserves a provider failure when workspace restore also fails", async () => {

@@ -22,8 +22,11 @@ import {
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetTimeoutSec,
   resolveAdapterExecutionTargetCommandForLogs,
+  restoreRemoteWorkspaceAfterExecution,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  withRemoteWorkspaceRestoreWarning,
+  type RemoteWorkspaceRestoreWarning,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -1294,7 +1297,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   };
 
-  try {
+  const runProvider = async (): Promise<AdapterExecutionResult> => {
     const minimumCliVersion = passesConfiguredModel && claudeCommandLooksLike(command, "claude")
       ? minimumClaudeCliVersionForModel(model)
       : null;
@@ -1389,6 +1392,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+  };
+
+  let providerResult: AdapterExecutionResult | null = null;
+  let restoreWarning: RemoteWorkspaceRestoreWarning | null = null;
+  try {
+    providerResult = await runProvider();
   } finally {
     try {
       await providerStop.collectBeforeRestore();
@@ -1397,12 +1406,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await paperclipBridge.stop();
       }
       if (restoreRemoteWorkspace) {
-        await onLog(
-          "stdout",
-          `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
-        );
-        await restoreRemoteWorkspace();
+        restoreWarning = await restoreRemoteWorkspaceAfterExecution({
+          target: executionTarget,
+          remoteDir: effectiveExecutionCwd,
+          restore: restoreRemoteWorkspace,
+          onLog,
+        });
       }
     }
   }
+  return withRemoteWorkspaceRestoreWarning(providerResult, restoreWarning);
 }
