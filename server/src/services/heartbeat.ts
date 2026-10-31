@@ -1397,6 +1397,7 @@ export function heartbeatService(
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    readmitBlockedStageHandoffs,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
   } = heartbeatQueue;
@@ -5279,6 +5280,7 @@ export function heartbeatService(
     resumeRemoteStopComments,
     resumeQueuedCommentInterrupt,
     resumeExecutionWaitComments,
+    readmitBlockedStageHandoffs,
 
     sweepStaleIssueLocks,
 
