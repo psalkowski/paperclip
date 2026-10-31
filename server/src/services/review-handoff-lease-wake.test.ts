@@ -39,7 +39,7 @@ vi.mock("./execution-blocker.js", async (importOriginal) => {
   }, 30000);
   afterAll(async () => { await database?.cleanup(); });
 
-  async function seed(stageType: "review" | "approval" = "review") {
+  async function seed(stageType: "review" | "approval" = "review", returnLeg = false) {
     const companyId = randomUUID(), reviewerId = randomUUID(), participantId = randomUUID();
     const issueId = randomUUID(), reviewerRunId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Handoff", defaultResponsibleUserId: "board",
@@ -51,9 +51,16 @@ vi.mock("./execution-blocker.js", async (importOriginal) => {
         status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
     ]);
     const stageId = randomUUID();
-    await db.insert(issues).values({ id: issueId, companyId, title: "Two-stage review", status: "in_review",
-      assigneeAgentId: participantId, executionState: { status: "pending", currentStageId: stageId,
-        currentStageType: stageType, currentParticipant: { type: "agent", agentId: participantId, userId: null } } });
+    // A return leg: the reviewer asked for changes and the issue is back with the executor.
+    const executionState = returnLeg
+      ? { status: "changes_requested", currentStageId: stageId, currentStageType: stageType,
+          currentParticipant: { type: "agent", agentId: reviewerId, userId: null },
+          returnAssignee: { type: "agent", agentId: participantId, userId: null },
+          reviewRequest: null, lastDecisionOutcome: "changes_requested" }
+      : { status: "pending", currentStageId: stageId, currentStageType: stageType,
+          currentParticipant: { type: "agent", agentId: participantId, userId: null } };
+    await db.insert(issues).values({ id: issueId, companyId, title: "Two-stage review",
+      status: returnLeg ? "in_progress" : "in_review", assigneeAgentId: participantId, executionState });
     // The approving run was stopped by the handoff; no process remains.
     await db.insert(heartbeatRuns).values({ id: reviewerRunId, companyId, agentId: reviewerId,
       runtimeMode: "legacy", status: "cancelled", errorCode: "issue_reassigned",
@@ -64,7 +71,7 @@ vi.mock("./execution-blocker.js", async (importOriginal) => {
       status: "active", provider: "kubernetes" }).returning();
     // Saturate the participant so an admitted wake stops at `queued`.
     await db.insert(heartbeatRuns).values({ companyId, agentId: participantId, status: "running" });
-    return { companyId, participantId, issueId, reviewerRunId, stageId, leaseId: lease.id };
+    return { companyId, reviewerId, participantId, issueId, reviewerRunId, stageId, leaseId: lease.id };
   }
 
   // The wake shape a stage decision produces for the next participant.
@@ -76,6 +83,18 @@ vi.mock("./execution-blocker.js", async (importOriginal) => {
     return { source: "assignment" as const, triggerDetail: "system" as const, reason,
       payload: { issueId: f.issueId, mutation: "update", executionStage, interruptedRunId: f.reviewerRunId },
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: reason,
+        source: "issue.execution_stage", executionStage, interruptedRunId: f.reviewerRunId } };
+  };
+
+  // The wake shape a changes-requested decision produces for the executor.
+  const returnWake = (f: Awaited<ReturnType<typeof seed>>) => {
+    const executionStage = { stageId: f.stageId, stageType: "review", wakeRole: "executor",
+      reviewRequest: null, allowedActions: ["address_changes", "resubmit"],
+      returnAssignee: { type: "agent", agentId: f.participantId, userId: null },
+      currentParticipant: { type: "agent", agentId: f.reviewerId, userId: null }, lastDecisionOutcome: "changes_requested" };
+    return { source: "assignment" as const, triggerDetail: "system" as const, reason: "execution_changes_requested",
+      payload: { issueId: f.issueId, mutation: "update", executionStage, interruptedRunId: f.reviewerRunId },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "execution_changes_requested",
         source: "issue.execution_stage", executionStage, interruptedRunId: f.reviewerRunId } };
   };
 
@@ -121,6 +140,42 @@ vi.mock("./execution-blocker.js", async (importOriginal) => {
     const [retired] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wait.id));
     expect((retired.payload as { executionWait?: { readmittedAt?: string } }).executionWait?.readmittedAt)
       .toBeTruthy();
+  });
+
+  it("starts the executor on a changes-requested return wake after the lease is released", async () => {
+    const f = await seed("review", true);
+    await heartbeatService(db).wakeup(f.participantId, returnWake(f));
+    const [wait] = await db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.participantId)));
+    expect(wait).toMatchObject({ status: "skipped", reason: "execution_reconciliation_required" });
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "succeeded" })
+      .where(eq(environmentLeases.id, f.leaseId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, wait.id));
+    await heartbeatService(db).resumeQueuedRuns();
+    await heartbeatService(db).resumeQueuedRuns();
+    const runs = await queuedRuns(f.companyId, f.participantId);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "execution_changes_requested",
+      source: "issue.execution_stage", interruptedRunId: f.reviewerRunId,
+      executionStage: { stageId: f.stageId, wakeRole: "executor", lastDecisionOutcome: "changes_requested" } });
+  });
+
+  it("does not re-admit a return wake once the task has moved on to another hop", async () => {
+    const f = await seed("review", true);
+    await heartbeatService(db).wakeup(f.participantId, returnWake(f));
+    const [wait] = await db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.participantId)));
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "succeeded" })
+      .where(eq(environmentLeases.id, f.leaseId));
+    // The executor resubmitted: the same stage is pending on the reviewer again,
+    // while the executor still owns the task.
+    await db.update(issues).set({ status: "in_review",
+      executionState: { status: "pending", currentStageId: f.stageId, currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: f.reviewerId, userId: null },
+        returnAssignee: { type: "agent", agentId: f.participantId, userId: null } } }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ updatedAt: new Date(0) }).where(eq(agentWakeupRequests.id, wait.id));
+    await heartbeatService(db).resumeQueuedRuns();
+    expect(await queuedRuns(f.companyId, f.participantId)).toHaveLength(0);
   });
 
   it("refuses at admission a stage wake whose stage changed after selection", async () => {

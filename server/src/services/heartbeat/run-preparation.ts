@@ -840,8 +840,9 @@ export interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
-    /** The pending execution stage the wake was built for. */
+    /** The execution stage the wake was built for, and the state it waits in. */
     executionStageId?: string;
+    executionStageStatus?: "pending" | "changes_requested";
     monitorNextCheckAt?: string;
     monitorWakeRequestedAt?: string;
   };

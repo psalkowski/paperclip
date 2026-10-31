@@ -223,6 +223,10 @@ const READMIT_STAGE_HANDOFF_AFTER_MS = 30_000;
 
 const STAGE_HANDOFF_READMIT_STATUSES = ["todo", "in_progress", "in_review", "blocked"] as const;
 
+/** A changes-requested decision wakes the executor named by `returnAssignee`,
+ * while the stage stays on the reviewer who requested the changes. */
+const STAGE_RETURN_WAKE_ROLE = "executor";
+
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
   "running",
@@ -1762,8 +1766,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
    * execution wait. That receipt is terminal, and the cleanup path re-promotes
    * only the finishing agent's own deferred wakes, so the next participant is
    * never started. This pass rebuilds that exact stage wake once the gate is
-   * gone and the task still waits on the same stage and participant. Ordinary
-   * admission decides the result, so every gate still applies.
+   * gone and the task still waits on the same stage and participant. The wake
+   * that returns changes to the executor is rebuilt the same way, against the
+   * `changes_requested` state naming that executor as the return assignee.
+   * Ordinary admission decides the result, so every gate still applies.
    */
   async function readmitBlockedStageHandoffs() {
     if ((await getSchedulingSuppression()).suppressed) return;
@@ -1780,9 +1786,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId' is null`,
         sql`${agentWakeupRequests.payload}->'executionWait'->>'readmittedAt' is null`,
         // The task must still wait on the same stage and participant.
-        sql`${issues.executionState}->>'status' = 'pending'`,
         sql`${issues.executionState}->>'currentStageId' = ${agentWakeupRequests.payload}->'executionStage'->>'stageId'`,
-        sql`${issues.executionState}->'currentParticipant'->>'agentId' = ${agentWakeupRequests.agentId}::text`,
+        or(
+          and(
+            sql`${issues.executionState}->>'status' = 'pending'`,
+            sql`${issues.executionState}->'currentParticipant'->>'agentId' = ${agentWakeupRequests.agentId}::text`,
+            sql`${agentWakeupRequests.payload}->'executionStage'->>'wakeRole' is distinct from ${STAGE_RETURN_WAKE_ROLE}`,
+          ),
+          // A return wake stays valid only while the stage's own changes-requested
+          // decision still waits on this executor; resubmitting moves the state on.
+          and(
+            sql`${issues.executionState}->>'status' = 'changes_requested'`,
+            sql`${issues.executionState}->'returnAssignee'->>'agentId' = ${agentWakeupRequests.agentId}::text`,
+            sql`${agentWakeupRequests.payload}->'executionStage'->>'wakeRole' = ${STAGE_RETURN_WAKE_ROLE}`,
+          ),
+        ),
         isNull(issues.executionRunId),
         // Only statuses admission accepts, so a parked task adds no refusals.
         inArray(issues.status, [...STAGE_HANDOFF_READMIT_STATUSES]),
@@ -1816,8 +1834,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         lte(agentWakeupRequests.updatedAt, new Date(Date.now() - READMIT_STAGE_HANDOFF_AFTER_MS)),
       )).returning({ id: agentWakeupRequests.id });
       if (!claimed) continue;
-      const reason = executionStage.stageType === "approval"
-        ? "execution_approval_requested" : "execution_review_requested";
+      const returnLeg = executionStage.wakeRole === STAGE_RETURN_WAKE_ROLE;
+      const waitingStatus = returnLeg ? "changes_requested" : "pending";
+      const reason = returnLeg ? "execution_changes_requested"
+        : executionStage.stageType === "approval" ? "execution_approval_requested" : "execution_review_requested";
       const { executionWait: _receipt, ...wakePayload } = payload;
       const interruptedRunId = readNonEmptyString(payload.interruptedRunId);
       // A replacement committed before an interruption carries this key; a later
@@ -1844,7 +1864,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Selection read the task outside the admission lock. Admission must
           // refuse a task whose status, owner or stage changed in between.
           issueStateGuard: { assigneeAgentId: wake.agentId, statuses: [...STAGE_HANDOFF_READMIT_STATUSES],
-            statusVersion, executionStageId: stageId },
+            statusVersion, executionStageId: stageId, executionStageStatus: waitingStatus },
           idempotencyKey: readmitKey,
         }));
       } catch (err) {
@@ -1861,8 +1881,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         const [current] = await db.select({ assigneeAgentId: issues.assigneeAgentId, executionState: issues.executionState })
           .from(issues).where(and(eq(issues.companyId, wake.companyId), eq(issues.id, issueId))).limit(1);
         const state = parseObject(current?.executionState);
-        const stillWaits = current?.assigneeAgentId === wake.agentId && state.status === "pending" &&
-          state.currentStageId === stageId && parseObject(state.currentParticipant).agentId === wake.agentId;
+        const waitingPrincipal = parseObject(returnLeg ? state.returnAssignee : state.currentParticipant);
+        const stillWaits = current?.assigneeAgentId === wake.agentId && state.status === waitingStatus &&
+          state.currentStageId === stageId && waitingPrincipal.agentId === wake.agentId;
         if (stillWaits) continue;
       }
       // The handoff reached a run, or the task no longer waits on it. Retire the receipt so no later pass rebuilds it.
@@ -3058,7 +3079,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
               (issueStateGuard.statusVersion !== undefined && issue.statusVersion !== issueStateGuard.statusVersion) ||
               (issueStateGuard.executionStageId !== undefined &&
-                (parseObject(issue.executionState).status !== "pending" ||
+                (parseObject(issue.executionState).status !== (issueStateGuard.executionStageStatus ?? "pending") ||
                   parseObject(issue.executionState).currentStageId !== issueStateGuard.executionStageId)) ||
               (issueStateGuard.monitorNextCheckAt !== undefined && (
                 activeMonitorRun !== null || issue.assigneeUserId !== null ||
