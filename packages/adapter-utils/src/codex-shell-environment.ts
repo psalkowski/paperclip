@@ -5,6 +5,26 @@ const PROVIDER_ONLY_KEYS: ReadonlySet<string> = new Set([
 ]);
 const IDENTITY_KEYS = ["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"];
 
+function customProviderCredentialNames(configuredEnvironment: Record<string, unknown>): Set<string> {
+  const raw = configuredEnvironment.PAPERCLIP_CODEX_PROVIDERS;
+  if (typeof raw !== "string") return new Set();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return new Set();
+  }
+  const providers = (parsed as { providers?: unknown } | null)?.providers;
+  if (!providers || typeof providers !== "object") return new Set();
+  const names = Object.values(providers).flatMap((provider) => {
+    if (!provider || typeof provider !== "object") return [];
+    const { env_key: envKey, env_http_headers: envHeaders } = provider as Record<string, unknown>;
+    const headerNames = envHeaders && typeof envHeaders === "object" ? Object.values(envHeaders) : [];
+    return [envKey, ...headerNames].filter((name): name is string => typeof name === "string");
+  });
+  return new Set(names.map((name) => name.toUpperCase()));
+}
+
 /** Only resolved adapter configuration can opt a service secret into shell access.
  * The launch environment here is Paperclip-built, never ambient process.env.
  * Return names only: values must stay out of provider config and argv.
@@ -14,10 +34,11 @@ export function codexShellEnvironmentKeys(
   configuredEnvironment: Record<string, unknown>,
   hasAgentIdentity: boolean,
 ): string[] {
+  const providerCredentials = customProviderCredentialNames(configuredEnvironment);
   const configuredSecrets = new Set(Object.entries(configuredEnvironment)
     .filter(([key, value]) => ENVIRONMENT_NAME.test(key) && typeof value === "string" && typeof environment[key] === "string"
       && !/^PAPERCLIP_(?:GITHUB_|RUNNER_|NATIVE_|ACPX_)/i.test(key)
-      && SECRET_NAME.test(key) && !PROVIDER_ONLY_KEYS.has(key.toUpperCase()))
+      && SECRET_NAME.test(key) && !PROVIDER_ONLY_KEYS.has(key.toUpperCase()) && !providerCredentials.has(key.toUpperCase()))
     .map(([key]) => key));
   return [...new Set([
     "PATH", "HOME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "TEMP", "TMP", "CODEX_HOME",
