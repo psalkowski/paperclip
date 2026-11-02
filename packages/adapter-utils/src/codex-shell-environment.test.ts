@@ -45,12 +45,8 @@ it("keeps a configured Git credential helper whole, with its GitHub token", () =
 });
 
 it("keeps a custom provider's credentials out of the service-secret opt-in", () => {
-  const providers = { providers: { gateway: { env_key: "GATEWAY_API_KEY", env_http_headers: { "X-Gateway-Token": "GATEWAY_HEADER_TOKEN" } } } };
-  const configured = {
-    PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(providers),
-    GATEWAY_API_KEY: "provider-canary", GATEWAY_HEADER_TOKEN: "header-canary", SLACK_BOT_TOKEN: "assigned",
-  };
-  const names = codexShellEnvironmentKeys(configured, configured, true);
+  const configured = { GATEWAY_API_KEY: "provider-canary", GATEWAY_HEADER_TOKEN: "header-canary", SLACK_BOT_TOKEN: "assigned" };
+  const names = codexShellEnvironmentKeys(configured, configured, true, new Set(["gateway_api_key", "GATEWAY_HEADER_TOKEN"]));
   expect(names).toContain("SLACK_BOT_TOKEN");
   expect(names).not.toContain("GATEWAY_API_KEY");
   expect(names).not.toContain("GATEWAY_HEADER_TOKEN");

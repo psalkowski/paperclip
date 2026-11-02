@@ -93,7 +93,7 @@ import {
   CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING_LOG_LINE,
   resolveCodexAuthPrecedence,
 } from "./auth-precedence.js";
-import { prepareCodexRuntimeConfig } from "./runtime-config.js";
+import { codexProviderCredentialNames, prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -1236,7 +1236,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
       const args = execArgs.args;
       const pricingContext = execArgs.fastModeApplied ? { serviceTier: "fast" } : undefined;
-      const shellKeys = codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity));
+      const providerCredentials = codexProviderCredentialNames(envConfigStrings);
+      const shellKeys = codexShellEnvironmentKeys(env, envConfigStrings, Boolean(ctx.agentIdentity), providerCredentials);
       args.unshift("-c", "features.shell_snapshot=false", "-c", 'shell_environment_policy.inherit="all"', "-c", "shell_environment_policy.ignore_default_excludes=true",
         "-c", `shell_environment_policy.include_only=${JSON.stringify(shellKeys)}`);
       const commandNotesWithFastMode =

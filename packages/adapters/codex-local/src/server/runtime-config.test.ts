@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { prepareCodexRuntimeConfig } from "./runtime-config.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { codexProviderCredentialNames, prepareCodexRuntimeConfig } from "./runtime-config.js";
 
 const cleanupPaths = new Set<string>();
 
@@ -412,5 +412,24 @@ describe("prepareCodexRuntimeConfig", () => {
     );
     const content = await readConfigToml(home);
     expect(content).toBe("model = \"gpt-5.1-codex\"\n");
+  });
+});
+
+describe("codexProviderCredentialNames", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("names the credentials of providers set in the run env or, failing that, the server env", () => {
+    const providers = { providers: { gateway: { base_url: "http://gateway", env_key: "GATEWAY_API_KEY", env_http_headers: { "X-Gateway-Token": "GATEWAY_HEADER_TOKEN" } } } };
+    expect(codexProviderCredentialNames({ PAPERCLIP_CODEX_PROVIDERS: JSON.stringify(providers) })).toEqual(new Set(["GATEWAY_API_KEY", "GATEWAY_HEADER_TOKEN"]));
+    vi.stubEnv("PAPERCLIP_CODEX_PROVIDERS", JSON.stringify(providers));
+    expect(codexProviderCredentialNames({ GATEWAY_API_KEY: "bound" })).toEqual(new Set(["GATEWAY_API_KEY", "GATEWAY_HEADER_TOKEN"]));
+  });
+
+  it("names nothing when no usable provider config exists", () => {
+    vi.stubEnv("PAPERCLIP_CODEX_PROVIDERS", "");
+    expect(codexProviderCredentialNames({})).toEqual(new Set());
+    expect(codexProviderCredentialNames({ PAPERCLIP_CODEX_PROVIDERS: "{not json" })).toEqual(new Set());
   });
 });

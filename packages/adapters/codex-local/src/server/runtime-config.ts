@@ -333,6 +333,21 @@ function configTomlBackupPath(configTomlPath: string): string {
 //
 // When the adapter config explicitly sets env.CODEX_HOME (a user-managed home),
 // pass codexHome: null -- the file is left untouched and a note is surfaced.
+export function codexProviderCredentialNames(env: Record<string, string>): Set<string> {
+  const resolveEnv = (name: string): string | undefined => env[name] ?? process.env[name];
+  const parsed = parseCodexProvidersConfig(
+    env.PAPERCLIP_CODEX_PROVIDERS ?? process.env.PAPERCLIP_CODEX_PROVIDERS,
+    resolveEnv,
+    [],
+  );
+  const providers = Object.values(parsed?.providers ?? {});
+  const names = providers.flatMap((provider) => {
+    const envHeaders = isPlainObject(provider.env_http_headers) ? Object.values(provider.env_http_headers) : [];
+    return [provider.env_key, ...envHeaders].filter((name): name is string => typeof name === "string");
+  });
+  return new Set(names);
+}
+
 export async function prepareCodexRuntimeConfig(input: {
   env: Record<string, string>;
   codexHome: string | null;
