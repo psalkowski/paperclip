@@ -125,6 +125,17 @@ describe("batched run secret redaction", () => {
       .toEqual([{ id: "a", text: REDACTED_EVENT_VALUE }]);
   });
 
+  it("finds an issue's runs through the indexed issueId expression alone", async () => {
+    const rows = [{ contextSnapshot: { paperclipSecretRedactions: [{ fingerprintSha256: "one", material: { value: secret } }] } }];
+    const { registry, where } = fixture(rows);
+    expect(await registry.redactForIssue("company-1", "issue-1", { body: secret })).toEqual({ body: REDACTED_EVENT_VALUE });
+    const predicate = new PgDialect().sqlToQuery(where.mock.calls[0][0]);
+    expect(predicate.params).toEqual(["company-1", "issue-1"]);
+    expect(predicate.sql).toContain("->> 'issueId' =");
+    expect(predicate.sql).not.toContain("paperclipIssue");
+    expect(predicate.sql).not.toMatch(/\bor\b/i);
+  });
+
   it("does not query for an empty list and fails closed on decryption failure", async () => {
     const { registry, select } = fixture([{ id: "a", contextSnapshot: { paperclipSecretRedactions: [{ fingerprintSha256: "one", material: {} }] } }]);
     expect(await registry.redactForRuns("company", [])).toEqual([]);

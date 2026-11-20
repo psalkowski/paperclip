@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
@@ -86,10 +86,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
-        or(
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-          sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
-        ),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
       ));
     return valuesForRuns(rows);
   }
